@@ -15,6 +15,34 @@ from torchvision.datasets import MNIST
 from torchvision import transforms
 
 
+class ApexWrapper():
+    def __init__(self, opt_level):
+        self.opt_level = opt_level
+
+    def process_model_optimizer_fn(self, model, optimizer):
+        from apex import amp
+        model, optimizer = amp.initialize(model, optimizer, opt_level=self.opt_level)
+        return model, optimizer
+
+    def process_loss_backward(self, loss, optimizer):
+        from apex import amp
+        with amp.scale_loss(loss, optimizer) as scaled_loss:
+            scaled_loss.backward()
+        self.scaled_loss = scaled_loss
+
+
+class NullWrapper():
+    def __init__(self, opt_level='O0'):
+        self.opt_level = opt_level
+
+    def process_model_optimizer_fn(self, model, optimizer):
+        return model, optimizer
+
+    def process_loss_backward(self, loss, optimizer):
+        loss.backward()
+        self.scaled_loss = loss
+
+
 class DemoModel(torch.nn.Module):
     def __init__(self):
         super(DemoModel, self).__init__()
@@ -33,10 +61,12 @@ class DemoModel(torch.nn.Module):
         return output, None
 
 
-def train(save_checkpoint):
+def train(save_checkpoint, amp_wrapper):
     model = DemoModel().cuda() if torch.cuda.is_available() else DemoModel()
     model.train()
     optimzier = torch.optim.AdamW(model.parameters(), lr=0.001)
+
+    model, optimizer = amp_wrapper.process_model_optimizer_fn(model, optimzier)
 
     mnist = MNIST(root='./data', train=True, download=True, transform=transforms.ToTensor())
     train_loader = DataLoader(mnist, batch_size=128, shuffle=True)
@@ -47,11 +77,11 @@ def train(save_checkpoint):
             output, loss = model(batch[0].cuda(), batch[1].cuda()) if torch.cuda.is_available() else model(batch[0], batch[1])
             optimzier.zero_grad()
 
-            loss.backward()
+            amp_wrapper.process_loss_backward(loss, optimizer)
 
             optimzier.step()
 
-        print(f'epoch: {i}, step: {steps}, loss: {loss.data}')
+        print(f'epoch: {i}, step: {steps}, loss: {loss.data}, scaled_loss: {amp_wrapper.scaled_loss.data}')
 
         torch.save(model.state_dict(), save_checkpoint)
 
@@ -83,5 +113,6 @@ def init_seed(seed):
 if __name__ == "__main__":
     init_seed(999)
     save_checkpoint = 'mnist_model.bin'
-    train(save_checkpoint)
+    train(save_checkpoint, ApexWrapper('O2'))
+    # train(save_checkpoint, NullWrapper())
     eval(save_checkpoint)
