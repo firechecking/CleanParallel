@@ -6,10 +6,12 @@
 # @Software: CleanParallel
 # @Description: amp.py
 
-import functools, types
+import functools, types, itertools
 
 import torch
 from .amp_state import amp_state, maybe_print
+from .lists import user_overrides, functional_overrides, tensor_overrides, torch_overrides
+from . import utils
 
 
 class O0:
@@ -144,6 +146,174 @@ def _process_optimizer(optimizer, master_weigths):
     return optimizer
 
 
+class Wrapper():
+    @classmethod
+    def cast(cls, mod, name, cast_func):
+        if not utils.has_func(mod, name):
+            return
+        orig_func = utils.get_func(mod, name)
+
+        @functools.wraps(orig_func)
+        def new_func(*args, **kwargs):
+            new_args = utils.casted_args(cast_func, args, kwargs)
+            return orig_func(*new_args, **kwargs)
+
+        utils.set_func(mod, name, new_func)
+
+    @classmethod
+    def promote(cls, mod, name):
+        if not utils.has_func(mod, name):
+            return
+        orig_func = utils.get_func(mod, name)
+
+        @functools.wraps(orig_func)
+        def new_func(*args, **kwargs):
+            types = utils.collect_fp_tensor_types(args, kwargs)
+            if len(types) <= 1: return orig_func(*args, **kwargs)
+            if types == set(['HalfTensor', 'FloatTensor']):
+                new_args = utils.casted_args(utils.maybe_float,
+                                             args,
+                                             kwargs)
+                return orig_func(*new_args, **kwargs)
+            raise NotImplementedError('Do not know how to handle ' +
+                                      'these types to promote: {}'
+                                      .format(types))
+
+        utils.set_func(mod, name, new_func)
+
+    @classmethod
+    def sequence_promote(cls, mod, name):
+        if not utils.has_func(mod, name):
+            return
+        orig_func = utils.get_func(mod, name)
+
+        @functools.wraps(orig_func)
+        def new_func(seq, *args, **kwargs):
+            types = set([utils.type_string(x) for x in seq])
+
+            if len(types) <= 1: return orig_func(seq, *args, **kwargs)
+            if types == set(['HalfTensor', 'FloatTensor']):
+                cast_seq = utils.casted_args(utils.maybe_float,
+                                             seq,
+                                             {})
+                return orig_func(cast_seq, *args, **kwargs)
+            return orig_func(seq, *args, **kwargs)
+
+        utils.set_func(mod, name, new_func)
+
+    @classmethod
+    def err_if_any_half(cls, mod, name):
+        if not utils.has_func(mod, name):
+            return
+        orig_fn = utils.get_func(mod, name)
+
+        @functools.wraps(orig_fn)
+        def new_func(*args, **kwargs):
+            types = utils.collect_fp_tensor_types(args, kwargs)
+            if 'HalfTensor' in types:
+                raise NotImplementedError('Cannot call in-place function ' +
+                                          '{} with fp16 arguments.'.format(name))
+            else:
+                return orig_fn(*args, **kwargs)
+
+        utils.set_func(mod, name, new_func)
+
+    @classmethod
+    def err_if_arg0_half(cls, mod, name):
+        if not utils.has_func(mod, name):
+            return
+        orig_fn = utils.get_func(mod, name)
+
+        @functools.wraps(orig_fn)
+        def new_func(arg0, *args, **kwargs):
+            assert utils.is_tensor_like(arg0)
+            if utils.type_string(arg0) == 'HalfTensor':
+                raise NotImplementedError('Cannot call in-place method ' +
+                                          '{} on fp16 Tensors.'.format(name))
+            else:
+                new_args = utils.casted_args(utils.maybe_float, args, kwargs)
+                return orig_fn(arg0, *new_args, **kwargs)
+
+        utils.set_func(mod, name, new_func)
+
+    @classmethod
+    def promote_match_arg0(cls, mod, name):
+        if not utils.has_func(mod, name):
+            return
+        orig_fn = utils.get_func(mod, name)
+
+        @functools.wraps(orig_fn)
+        def new_func(arg0, *args, **kwargs):
+            assert utils.is_tensor_like(arg0)
+            if utils.type_string(arg0) == 'HalfTensor':
+                cast_fn = utils.maybe_half
+            elif utils.type_string(arg0) == 'FloatTensor':
+                cast_fn = utils.maybe_float
+            else:
+                return orig_fn(arg0, *args, **kwargs)
+            new_args = utils.casted_args(cast_fn, args, kwargs)
+            return orig_fn(arg0, *new_args, **kwargs)
+
+        utils.set_func(mod, name, new_func)
+
+
+def _patch_torch_functions(allow_banned=False):
+    ############### fp16、fp32白名单 ###############
+    for module in [functional_overrides, torch_overrides, tensor_overrides]:
+        for name in getattr(module, 'FP16_FUNCS'):
+            Wrapper.cast(module.MODULE, name, utils.maybe_half)
+        for name in getattr(module, 'FP32_FUNCS'):
+            Wrapper.cast(module.MODULE, name, utils.maybe_float)
+
+    ############### 将混合输入转成float ###############
+    for module in [torch_overrides, tensor_overrides]:
+        for name in getattr(module, 'CASTS'):
+            Wrapper.promote(module.MODULE, name)
+        for name in getattr(module, 'SEQUENCE_CASTS'):
+            Wrapper.sequence_promote(module.MODULE, name)
+
+    ############### cuda.tensor ###############
+    if utils.tensor_is_float_tensor():
+        for name in tensor_overrides.FP16_FUNCS:
+            Wrapper.cast(torch.cuda.FloatTensor, name, utils.maybe_half)
+        for name in tensor_overrides.FP32_FUNCS:
+            Wrapper.cast(torch.cuda.HalfTensor, name, utils.maybe_float)
+        for name in tensor_overrides.CASTS:
+            Wrapper.promote(torch.cuda.FloatTensor, name)
+            Wrapper.promote(torch.cuda.HalfTensor, name)
+        for name in tensor_overrides.SEQUENCE_CASTS:
+            Wrapper.sequence_promote(torch.cuda.FloatTensor, name)
+            Wrapper.sequence_promote(torch.cuda.HalfTensor, name)
+
+    ############### inplace操作 ###############
+    for name in utils.as_inplace(torch_overrides.FP32_FUNCS):
+        Wrapper.err_if_any_half(torch_overrides.MODULE, name)
+    for name in utils.as_inplace(tensor_overrides.FP32_FUNCS):
+        Wrapper.err_if_arg0_half(tensor_overrides.MODULE, name)
+    for name in utils.as_inplace(itertools.chain(
+            tensor_overrides.FP16_FUNCS,
+            tensor_overrides.CASTS)):
+        Wrapper.promote_match_arg0(tensor_overrides.MODULE, name)
+        if utils.tensor_is_float_tensor():
+            Wrapper.promote_match_arg0(torch.cuda.HalfTensor, name)
+            Wrapper.promote_match_arg0(torch.cuda.FloatTensor, name)
+
+    ############### 对受限funcs操作 ###############
+    for name, err_msg in functional_overrides.BANNED_FUNCS:
+        if allow_banned:
+            Wrapper.cast(functional_overrides.MODULE, name, utils.maybe_float)
+        else:
+            Wrapper.err_if_any_half(functional_overrides.MODULE, name)
+
+    ############### 用户自定义functions ###############
+    for mod, name, cast_func in user_overrides._USER_CAST_REGISTRY:
+        Wrapper.cast(mod, name, cast_func)
+    for mod, name in user_overrides._USER_PROMOTE_REGISTRY:
+        Wrapper.promote(mod, name)
+    user_overrides._USER_CAST_REGISTRY.clear()
+    user_overrides._USER_PROMOTE_REGISTRY.clear()
+
+
 def initialize(
         models,
         optimizers=None,
@@ -194,6 +364,9 @@ def initialize(
     optimizers, optimizers_was_list = (optimizers, True) if isinstance(optimizers, list) else ([optimizers, ], False)
     for i, optimizer in enumerate(optimizers):
         optimizers[i] = _process_optimizer(optimizer, amp_state.opt_properties.master_weights)
+
+    ############### 处理patch_torch_functions ###############
+    _patch_torch_functions()
 
 
 if __name__ == "__main__":
