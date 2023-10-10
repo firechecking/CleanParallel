@@ -12,6 +12,7 @@ import torch
 from .amp_state import amp_state, maybe_print
 from .lists import user_overrides, functional_overrides, tensor_overrides, torch_overrides
 from . import utils
+from .scaler import LossScaler
 
 
 class O0:
@@ -367,6 +368,14 @@ def initialize(
 
     ############### 处理patch_torch_functions ###############
     _patch_torch_functions()
+
+    ############### 初始化loss scaler ###############
+    amp_state.loss_scaler = LossScaler(loss_scale=amp_state.opt_properties.loss_scale, min_loss_scale=min_loss_scale, max_loss_scale=max_loss_scale)
+
+    ############### 结果返回 ###############
+    if not models_was_list: models = models[0]
+    if not optimizers_was_list: optimizers = optimizers[0]
+    return models, optimizers
 
 
 if __name__ == "__main__":
