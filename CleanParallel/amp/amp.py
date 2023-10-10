@@ -6,7 +6,7 @@
 # @Software: CleanParallel
 # @Description: amp.py
 
-import functools
+import functools, types
 
 import torch
 from .amp_state import amp_state, maybe_print
@@ -87,6 +87,63 @@ class O2StateDictHook(object):
                 state_dict[key] = self.fn(param)
 
 
+class AmpOptimizerState(object):
+    pass
+
+
+def _process_optimizer(optimizer, master_weigths):
+    optimizer._amp_stash = AmpOptimizerState()
+    ############### 复制master_weights ###############
+    optimizer._amp_stash.fp16_to_fp32_params = {}
+
+    if master_weigths:
+        for group in optimizer.param_groups:
+            for i, param in enumerate(group['params']):
+                if param.requires_grad:
+                    if param.type() in ('torch.cuda.HalfTensor', 'torch.HalfTensor'):
+                        group['params'][i] = master_weight = param.detach().clone().float()
+                        master_weight.requires_grad = True
+                        optimizer._amp_stash.fp16_to_fp32_params[param] = master_weight
+
+                        if param in optimizer.state:
+                            optimizer.state[master_weight] = optimizer.state.pop(param)
+
+    ############### 处理step ###############
+    old_step = optimizer.step
+
+    def new_step(self, closure=None):
+        if closure is not None:
+            raise RuntimeError("Currently, Amp does not support closure use with optimizers.")
+        ############### 将计算图中half类型的grad复制到master_weight.grad ###############
+        for half_weight, master_weight in self._amp_stash.fp16_to_fp32_params.items():
+            if half_weight.grad is not None and master_weight.grad is None:
+                master_weight.grad = torch.empty_like(master_weight)
+                master_weight.grad.copy_(half_weight.grad)
+        ############### 常规的用grad更新weight ###############
+        ret_val = old_step()
+        ############### 将master_weight复制到half ###############
+        for half_weight, master_weight in self._amp_stash.fp16_to_fp32_params.items():
+            half_weight.data.copy_(master_weight.data)
+
+        return ret_val
+
+    optimizer.step = types.MethodType(new_step, optimizer)
+
+    ############### 处理zero_grad ###############
+    old_zero_grad = optimizer.zero_grad
+
+    def new_zero_grad(self):
+        old_zero_grad()
+        for param in optimizer._amp_stash.fp16_to_fp32_params.keys():  # 计算图中的half类型也需要清除grad
+            if param.grad is not None:
+                param.grad.detach_()
+                param.grad.zero_()
+
+    optimizer.zero_grad = types.MethodType(new_zero_grad, optimizer)
+
+    return optimizer
+
+
 def initialize(
         models,
         optimizers=None,
@@ -132,6 +189,11 @@ def initialize(
         output_caster = functools.partial(to_type, dtype=cast_model_outputs)
         for model in models:
             model.forward = patch_forward(model.forward, output_caster=output_caster)
+
+    ############### 处理optimizer及master_weights ###############
+    optimizers, optimizers_was_list = (optimizers, True) if isinstance(optimizers, list) else ([optimizers, ], False)
+    for i, optimizer in enumerate(optimizers):
+        optimizers[i] = _process_optimizer(optimizer, amp_state.opt_properties.master_weights)
 
 
 if __name__ == "__main__":
