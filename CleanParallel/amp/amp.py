@@ -127,6 +127,12 @@ def initialize(
             for module in model.modules():
                 module._register_state_dict_hook(O2StateDictHook(functools.partial(to_type, dtype=torch.float32)))
 
+    ############### 处理cast_model_outputs ###############
+    if cast_model_outputs is not None:
+        output_caster = functools.partial(to_type, dtype=cast_model_outputs)
+        for model in models:
+            model.forward = patch_forward(model.forward, output_caster=output_caster)
+
 
 if __name__ == "__main__":
     pass
