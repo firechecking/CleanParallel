@@ -6,6 +6,8 @@
 # @Software: CleanParallel
 # @Description: amp.py
 
+import functools
+
 import torch
 from .amp_state import amp_state, maybe_print
 
@@ -55,6 +57,36 @@ def update_opt_properities(opt_properties, custom_properties):
     return opt_properties
 
 
+def to_type(v, dtype):
+    if isinstance(v, torch.Tensor) and v.is_floating_point():
+        return v.to(dtype)
+    return v
+
+
+def patch_forward(old_forward, input_caster=None, output_caster=None):
+    input_caster = (lambda x: x) if input_caster is None else input_caster
+    output_caster = (lambda x: x) if output_caster is None else output_caster
+
+    def new_forward(*args, **kwargs):
+        args = input_caster(args)
+        kwargs = input_caster(kwargs)
+        output = old_forward(*args, **kwargs)
+        return output_caster(output)
+
+    return new_forward
+
+
+class O2StateDictHook(object):
+    def __init__(self, fn):
+        self.fn = fn
+
+    def __call__(self, module, state_dict, prefix, local_metadata):
+        for key in state_dict:
+            param = state_dict[key]
+            if 'Half' in param.type():
+                state_dict[key] = self.fn(param)
+
+
 def initialize(
         models,
         optimizers=None,
@@ -78,6 +110,22 @@ def initialize(
     amp_state.opt_properties = update_opt_properities(amp_state.opt_properties, custom_properties)
     for k, v in amp_state.opt_properties.__dict__.items():
         maybe_print('{:22}: {}'.format(k, v))
+
+    ############### 处理cast_model_type ###############
+    models, models_was_list = (models, True) if isinstance(models, list) else ([models, ], False)
+    # TODO: 校验models不能是parallel或重复amp模型
+    if amp_state.opt_properties.cast_model_type:
+        input_caster = functools.partial(to_type, dtype=amp_state.opt_properties.cast_model_type)
+        for model in models:
+            ############### 转换模型: parameters ###############
+            model.to(amp_state.opt_properties.cast_model_type)
+
+            ############### 转换模型: inputs ###############
+            model.forward = patch_forward(model.forward, input_caster=input_caster)
+
+            ############### 转换模型: state_dict ###############
+            for module in model.modules():
+                module._register_state_dict_hook(O2StateDictHook(functools.partial(to_type, dtype=torch.float32)))
 
 
 if __name__ == "__main__":
