@@ -31,6 +31,22 @@ class ApexWrapper():
         self.scaled_loss = scaled_loss
 
 
+class AmpWrapper():
+    def __init__(self, opt_level):
+        self.opt_level = opt_level
+
+    def process_model_optimizer_fn(self, model, optimizer):
+        from CleanParallel import amp
+        model, optimizer = amp.initialize(model, optimizer, opt_level=self.opt_level)
+        return model, optimizer
+
+    def process_loss_backward(self, loss, optimizer):
+        from CleanParallel import amp
+        with amp.scale_loss(loss, optimizer) as scaled_loss:
+            scaled_loss.backward()
+        self.scaled_loss = scaled_loss
+
+
 class NullWrapper():
     def __init__(self, opt_level='O0'):
         self.opt_level = opt_level
@@ -113,6 +129,7 @@ def init_seed(seed):
 if __name__ == "__main__":
     init_seed(999)
     save_checkpoint = 'mnist_model.bin'
-    train(save_checkpoint, ApexWrapper('O2'))
+    # train(save_checkpoint, ApexWrapper('O2'))
     # train(save_checkpoint, NullWrapper())
+    train(save_checkpoint, AmpWrapper('O2'))
     eval(save_checkpoint)
