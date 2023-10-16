@@ -33,7 +33,19 @@ def scale_loss(loss, optimizers):
 
     loss_scaler.clear_overflow_state()
     for optimizer in optimizers:
-        loss_scaler.unscale(optimizer)
+        model_weights, master_weights = [], []
+        for model_weight, master_weight in optimizer._amp_stash.fp16_to_fp32_params.items():
+            model_weights.append(model_weight)
+            master_weights.append(master_weight)
+        loss_scaler.unscale(model_weights, master_weights)
+
+        model_weights = []
+        for group in optimizer.param_groups:
+            for i, param in enumerate(group['params']):
+                if param.requires_grad and param not in optimizer._amp_stash.fp16_to_fp32_params:
+                    model_weights.append(param)
+        loss_scaler.unscale(model_weights, model_weights)
+
     should_skip = loss_scaler.update_scale()
 
     ############### 如果有溢出，跳过本次权重更新 ###############
@@ -76,20 +88,20 @@ class LossScaler():
     def clear_overflow_state(self):
         self.has_overflow = False
 
-    def unscale(self, optimizer):
+    def unscale(self, model_weights, master_weights):
         if self.has_overflow: return
         if self.loss_scale == 1.0: return
-        for half_weight, master_weight in optimizer._amp_stash.fp16_to_fp32_params.items():
+        for model_weight, master_weight in zip(model_weights, master_weights):
             ############### 判断grad是否有溢出 ###############
-            _sum = float(half_weight.grad.float().sum())
+            _sum = float(model_weight.grad.float().sum())
             if _sum == float('inf') or _sum == -float('inf') or _sum != _sum:
                 self.has_overflow = True
                 return
             ############### 将计算图中half类型的grad复制到master_weight.grad ###############
             if master_weight.grad is None:
                 master_weight.grad = torch.empty_like(master_weight)
-            if master_weight.grad is not half_weight.grad:
-                master_weight.grad.copy_(half_weight.grad)
+            if master_weight.grad is not model_weight.grad:
+                master_weight.grad.copy_(model_weight.grad)
             ############### loss_scale还原 ###############
             master_weight.grad.mul_(1.0 / self.loss_scale)
 
