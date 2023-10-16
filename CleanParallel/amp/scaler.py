@@ -36,6 +36,27 @@ def scale_loss(loss, optimizers):
         loss_scaler.unscale(optimizer)
     should_skip = loss_scaler.update_scale()
 
+    ############### 如果有溢出，跳过本次权重更新 ###############
+    if should_skip:
+        for optimizer in optimizers:
+            if not hasattr(optimizer._amp_stash, 'skip_patched'):
+                optimizer._amp_stash.skip_patched = False
+
+            if not optimizer._amp_stash.skip_patched:
+                old_step = optimizer.step
+
+                def patch_skep_step(self, closure=None):
+                    if closure is not None:
+                        raise RuntimeError("Currently, Amp does not support closure use with optimizers.")
+
+                    maybe_print(("Gradient overflow.  Skipping step, loss scaler " +
+                                 "reducing loss scale to {}").format(loss_scaler.loss_scale))
+                    self.step = old_step
+                    self._amp_stash.skip_patched = False
+
+                optimizer.step = types.MethodType(patch_skep_step, optimizer)
+                optimizer._amp_stash.skip_patched = True
+
 
 class LossScaler():
     def __init__(self,
