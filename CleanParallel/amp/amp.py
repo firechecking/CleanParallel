@@ -6,7 +6,7 @@
 # @Software: CleanParallel
 # @Description: amp.py
 
-import functools, types, itertools
+import functools, types, itertools, contextlib
 
 import torch
 from .amp_state import amp_state, maybe_print
@@ -156,6 +156,9 @@ class Wrapper():
 
         @functools.wraps(orig_func)
         def new_func(*args, **kwargs):
+            if not amp_state.function_casts_enabled:
+                return orig_func(*args, **kwargs)
+
             new_args = utils.casted_args(cast_func, args, kwargs)
             return orig_func(*new_args, **kwargs)
 
@@ -169,6 +172,9 @@ class Wrapper():
 
         @functools.wraps(orig_func)
         def new_func(*args, **kwargs):
+            if not amp_state.function_casts_enabled:
+                return orig_func(*args, **kwargs)
+
             types = utils.collect_fp_tensor_types(args, kwargs)
             if len(types) <= 1: return orig_func(*args, **kwargs)
             if types == set(['HalfTensor', 'FloatTensor']):
@@ -190,6 +196,9 @@ class Wrapper():
 
         @functools.wraps(orig_func)
         def new_func(seq, *args, **kwargs):
+            if not amp_state.function_casts_enabled:
+                return orig_func(seq, *args, **kwargs)
+
             types = set([utils.type_string(x) for x in seq])
 
             if len(types) <= 1: return orig_func(seq, *args, **kwargs)
@@ -206,16 +215,16 @@ class Wrapper():
     def err_if_any_half(cls, mod, name):
         if not utils.has_func(mod, name):
             return
-        orig_fn = utils.get_func(mod, name)
+        orig_func = utils.get_func(mod, name)
 
-        @functools.wraps(orig_fn)
+        @functools.wraps(orig_func)
         def new_func(*args, **kwargs):
             types = utils.collect_fp_tensor_types(args, kwargs)
             if 'HalfTensor' in types:
                 raise NotImplementedError('Cannot call in-place function ' +
                                           '{} with fp16 arguments.'.format(name))
             else:
-                return orig_fn(*args, **kwargs)
+                return orig_func(*args, **kwargs)
 
         utils.set_func(mod, name, new_func)
 
@@ -223,9 +232,9 @@ class Wrapper():
     def err_if_arg0_half(cls, mod, name):
         if not utils.has_func(mod, name):
             return
-        orig_fn = utils.get_func(mod, name)
+        orig_func = utils.get_func(mod, name)
 
-        @functools.wraps(orig_fn)
+        @functools.wraps(orig_func)
         def new_func(arg0, *args, **kwargs):
             assert utils.is_tensor_like(arg0)
             if utils.type_string(arg0) == 'HalfTensor':
@@ -233,7 +242,7 @@ class Wrapper():
                                           '{} on fp16 Tensors.'.format(name))
             else:
                 new_args = utils.casted_args(utils.maybe_float, args, kwargs)
-                return orig_fn(arg0, *new_args, **kwargs)
+                return orig_func(arg0, *new_args, **kwargs)
 
         utils.set_func(mod, name, new_func)
 
@@ -241,19 +250,23 @@ class Wrapper():
     def promote_match_arg0(cls, mod, name):
         if not utils.has_func(mod, name):
             return
-        orig_fn = utils.get_func(mod, name)
+        orig_func = utils.get_func(mod, name)
 
-        @functools.wraps(orig_fn)
+        @functools.wraps(orig_func)
         def new_func(arg0, *args, **kwargs):
             assert utils.is_tensor_like(arg0)
+
+            if not amp_state.function_casts_enabled:
+                return orig_func(arg0, *args, **kwargs)
+
             if utils.type_string(arg0) == 'HalfTensor':
                 cast_fn = utils.maybe_half
             elif utils.type_string(arg0) == 'FloatTensor':
                 cast_fn = utils.maybe_float
             else:
-                return orig_fn(arg0, *args, **kwargs)
+                return orig_func(arg0, *args, **kwargs)
             new_args = utils.casted_args(cast_fn, args, kwargs)
-            return orig_fn(arg0, *new_args, **kwargs)
+            return orig_func(arg0, *new_args, **kwargs)
 
         utils.set_func(mod, name, new_func)
 
@@ -315,6 +328,13 @@ def _patch_torch_functions(allow_banned=False):
     user_overrides._USER_PROMOTE_REGISTRY.clear()
 
 
+@contextlib.contextmanager
+def disable_function_casts():
+    amp_state.function_casts_enabled = False
+    yield
+    amp_state.function_casts_enabled = True
+
+
 def initialize(
         models,
         optimizers=None,
@@ -367,7 +387,18 @@ def initialize(
         optimizers[i] = _process_optimizer(optimizer, amp_state.opt_properties.master_weights)
 
     ############### 处理patch_torch_functions ###############
-    _patch_torch_functions()
+    if amp_state.opt_properties.patch_torch_functions:
+        _patch_torch_functions()
+        for optimizer in optimizers:
+            ############### optimizer.step()作用于fp32，所以需要禁用类型转换###############
+            old_step = optimizer.step
+
+            def new_step(self, *args, **kwargs):
+                with disable_function_casts():
+                    output = old_step(*args, **kwargs)
+                return output
+
+            optimizer.step = types.MethodType(new_step, optimizer)
 
     ############### 初始化loss scaler ###############
     amp_state.loss_scaler = LossScaler(loss_scale=amp_state.opt_properties.loss_scale, min_loss_scale=min_loss_scale, max_loss_scale=max_loss_scale)

@@ -13,6 +13,7 @@ class AmpState():
     def __init__(self):
         self.verbosity = 1
         self.enabled = True
+        self.function_casts_enabled = True
 
 
 ############### 如果是分布式训练，只在rank0打印 ###############
