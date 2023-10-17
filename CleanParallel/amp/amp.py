@@ -6,9 +6,11 @@
 # @Software: CleanParallel
 # @Description: amp.py
 
+import collections.abc as container_abcs
 import functools, types, itertools, contextlib
 
 import torch
+import numpy as np
 from .amp_state import amp_state, maybe_print
 from .lists import user_overrides, functional_overrides, tensor_overrides, torch_overrides
 from . import utils
@@ -61,9 +63,20 @@ def update_opt_properities(opt_properties, custom_properties):
 
 
 def to_type(v, dtype):
-    if isinstance(v, torch.Tensor) and v.is_floating_point():
+    if isinstance(v, torch.Tensor):
+        if v.is_floating_point():
+            return v.to(dtype)
+        return v
+    elif isinstance(v, str) or isinstance(v, np.ndarray):
+        return v
+    elif hasattr(v, "to"):  # Allow handling of custom batch classes
         return v.to(dtype)
-    return v
+    elif isinstance(v, container_abcs.Mapping):
+        return {to_type(_k, dtype): to_type(_v, dtype) for _k, _v in v.items()}
+    elif isinstance(v, container_abcs.Iterable):
+        return type(v)(to_type(_v, dtype) for _v in v)
+    else:
+        return v
 
 
 def patch_forward(old_forward, input_caster=None, output_caster=None):
