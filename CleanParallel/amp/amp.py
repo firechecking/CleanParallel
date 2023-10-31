@@ -64,6 +64,7 @@ def update_opt_properities(opt_properties, custom_properties):
 
 def to_type(v, dtype):
     if isinstance(v, torch.Tensor):
+        ############### torch.Tensor类型只处理浮点型 ###############
         if v.is_floating_point():
             return v.to(dtype)
         return v
@@ -72,8 +73,10 @@ def to_type(v, dtype):
     elif hasattr(v, "to"):  # Allow handling of custom batch classes
         return v.to(dtype)
     elif isinstance(v, container_abcs.Mapping):
+        ############### dict类型递归调用 ###############
         return {to_type(_k, dtype): to_type(_v, dtype) for _k, _v in v.items()}
     elif isinstance(v, container_abcs.Iterable):
+        ############### 可枚举类型递归调用 ###############
         return type(v)(to_type(_v, dtype) for _v in v)
     else:
         return v
@@ -169,9 +172,11 @@ class Wrapper():
 
         @functools.wraps(orig_func)
         def new_func(*args, **kwargs):
+            ############### 禁用转换 ###############
             if not amp_state.function_casts_enabled:
                 return orig_func(*args, **kwargs)
 
+            ############### 启用转换 ###############
             new_args = utils.casted_args(cast_func, args, kwargs)
             return orig_func(*new_args, **kwargs)
 
@@ -343,6 +348,7 @@ def _patch_torch_functions(allow_banned=False):
 
 @contextlib.contextmanager
 def disable_function_casts():
+    ############### 临时禁用转换 ###############
     amp_state.function_casts_enabled = False
     yield
     amp_state.function_casts_enabled = True
@@ -403,7 +409,7 @@ def initialize(
     if amp_state.opt_properties.patch_torch_functions:
         _patch_torch_functions()
         for optimizer in optimizers:
-            ############### optimizer.step()作用于fp32，所以需要禁用类型转换###############
+            ############### optimizer.step()作用于fp32，需要禁用类型转换 ###############
             old_step = optimizer.step
 
             def new_step(self, *args, **kwargs):
