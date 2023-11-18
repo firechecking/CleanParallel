@@ -2,9 +2,9 @@
 # @Time    : 2023/10/31 19:53
 # @Author  : Patrick
 # @Email   : firechecking@gmail.com
-# @File    : DistributedDataParallel.py.py
+# @File    : DistributedDataParallel.py
 # @Software: CleanParallel
-# @Description: DistributedDataParallel.py
+# @Description: DistributedDataParallel
 
 from collections import OrderedDict
 from itertools import chain
